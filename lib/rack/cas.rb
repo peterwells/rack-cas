@@ -16,29 +16,29 @@ class Rack::CAS
     request = Rack::Request.new(env)
     cas_request = CASRequest.new(request)
 
-    if cas_request.path_matches? RackCAS.config.exclude_path || RackCAS.config.exclude_paths
-      return @app.call(env)
-    end
+    return @app.call(env) if exclude_request?(cas_request)
 
     if cas_request.ticket_validation?
       log env, 'rack-cas: Intercepting ticket validation request.'
+
+      service_url = RackCAS.config.service? ? RackCAS.config.service : cas_request.service_url
 
       begin
         user, extra_attrs = get_user(request.url, cas_request.ticket)
       rescue RackCAS::ServiceValidationResponse::TicketInvalidError, RackCAS::SAMLValidationResponse::TicketInvalidError
         log env, 'rack-cas: Invalid ticket. Redirecting to CAS login.'
 
-        return redirect_to server.login_url(cas_request.service_url).to_s
+        return redirect_to server.login_url(service_url).to_s
       end
 
       store_session request, user, cas_request.ticket, extra_attrs
-      return redirect_to cas_request.service_url
+      return redirect_to service_url
     end
 
     if cas_request.logout?
       log env, 'rack-cas: Intercepting logout request.'
 
-      request.session.clear
+      request.session.send (request.session.respond_to?(:destroy) ? :destroy : :clear)
       return redirect_to server.logout_url(request.params).to_s
     end
 
@@ -51,10 +51,20 @@ class Rack::CAS
 
     response = @app.call(env)
 
-    if response[0] == 401 # access denied
+    if response[0] == 401 && !ignore_intercept?(request) # access denied
       log env, 'rack-cas: Intercepting 401 access denied response. Redirecting to CAS login.'
 
-      redirect_to server.login_url(request.url).to_s
+      url = if RackCAS.config.service?
+              configured_service_url = RackCAS::URL.parse(RackCAS.config.service)
+              request_url            = RackCAS::URL.parse(request.url)
+              request_url.host       = configured_service_url.host
+              request_url.scheme     = configured_service_url.scheme
+              request_url.to_s
+            else
+              cas_request.service_url
+            end
+
+      redirect_to server.login_url(url).to_s
     else
       response
     end
@@ -64,6 +74,19 @@ class Rack::CAS
 
   def server
     @server ||= RackCAS::Server.new(RackCAS.config.server_url)
+  end
+
+  def ignore_intercept?(request)
+    return false if (validator = RackCAS.config.ignore_intercept_validator).nil?
+    validator.call(request)
+  end
+
+  def exclude_request?(cas_request)
+    if (validator = RackCAS.config.exclude_request_validator)
+      validator.call(cas_request.request)
+    else
+      cas_request.path_matches? RackCAS.config.exclude_path || RackCAS.config.exclude_paths
+    end
   end
 
   def get_user(service_url, ticket)
